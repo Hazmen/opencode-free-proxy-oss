@@ -12,7 +12,7 @@ app.use(express.json({ limit: "10mb" }));
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 const PORT = process.env.PROXY_PORT || 6446;
-const PROXY_VERSION = "15";
+const PROXY_VERSION = "17";
 const BACKEND = "cli"; // requests are executed by genuine `opencode run`
 
 // Resolve opencode binary: $OPENCODE_BIN → default npm location → PATH.
@@ -77,6 +77,26 @@ async function refreshModels() {
 await refreshModels();
 if (MODELS_REFRESH_MS > 0) setInterval(refreshModels, MODELS_REFRESH_MS).unref?.();
 
+// Reasoning variants accepted by `opencode run --variant` per model
+// (source: `opencode models opencode --verbose`). Empty/absent = provider
+// default, no --variant flag is sent.
+const VARIANTS = {
+  "space-bunny-free": ["low", "medium", "high", "xhigh", "max"],
+  "ling-3.0-flash-fin-free": ["low", "medium", "high"],
+  "ling-3.1-flash-free": ["low", "medium", "high"],
+  "longcat-2.5-preview-free": ["low", "medium", "high"],
+  "fledge-alpha-free": ["low", "high", "max"],
+  "muse-spark-1.3-contributor-free": ["minimal", "low", "medium", "high", "xhigh"],
+};
+
+// Pick a valid --variant for the model, or null (provider default).
+// Accepts OpenAI `reasoning_effort`, `{ reasoning: { effort } }`, or a raw string.
+function pickVariant(model, effort) {
+  const v = typeof effort === "string" ? effort.trim().toLowerCase() : null;
+  if (!v) return null;
+  return (VARIANTS[model] || []).includes(v) ? v : null;
+}
+
 // ── API Keys ───────────────────────────────────────────────────────
 const keysFile = process.env.KEYS_FILE || "./api-keys.json";
 let apiKeys = {};
@@ -133,9 +153,66 @@ function msgText(m) {
   if (typeof c === "string") return c;
   if (Array.isArray(c)) {
     const t = c.filter((b) => b.type === "text").map((b) => b.text || "").join("\n");
-    return t || JSON.stringify(c);
+    const urls = c.flatMap((b) => {
+      const u = b?.type === "image_url" ? (b.image_url?.url ?? b.url)
+        : (b?.type === "image" ? "inline" : null);
+      return u ? [String(u)] : [];
+    });
+    let note = "";
+    const local = urls.filter((u) => u.startsWith("data:") || u === "inline").length;
+    if (local) note += `\n[${local} image(s) attached as file(s) — see attached files]`;
+    for (const u of urls.filter((u) => /^https?:\/\//.test(u)).slice(0, 4)) {
+      note += `\n[remote image (not attached, URL only): ${u.slice(0, 300)}]`;
+    }
+    return (t || JSON.stringify(c)) + note;
   }
   return JSON.stringify(c ?? "");
+}
+
+// ── Image attachments ──────────────────────────────────────────────
+// OpenAI `image_url` / Anthropic `image` parts carry no weight in a text
+// prompt, so base64 payloads are saved to temp files and handed to
+// `opencode run --file` (native attachment path). Remote URLs can't be
+// fetched safely here and stay a text placeholder (see msgText).
+let imgSeq = 0;
+function saveBase64Image(b64, mediaType) {
+  const clean = String(b64 || "").replace(/\s/g, "");
+  if (!clean || clean.length % 4 !== 0) return null;
+  if (!/^[A-Za-z0-9+/=]+$/.test(clean.slice(0, 200))) return null;
+  const ext = String(mediaType || "image/png").split("/")[1]?.split(/[+;]/)[0]?.replace(/[^a-z0-9]/gi, "") || "png";
+  const file = path.join(os.tmpdir(), `oc-img-${Date.now().toString(36)}-${(imgSeq++).toString(36)}.${ext}`);
+  try {
+    fs.writeFileSync(file, Buffer.from(clean, "base64"));
+    return file;
+  } catch { return null; }
+}
+
+// Scan OpenAI-style messages for image_url parts. data: URLs become temp
+// files; remote URLs stay placeholders (counted for logging).
+function extractOpenAIImages(messages) {
+  const files = [];
+  let remote = 0;
+  for (const m of messages || []) {
+    if (!Array.isArray(m?.content)) continue;
+    for (const b of m.content) {
+      if (b?.type !== "image_url") continue;
+      const url = String(b.image_url?.url ?? b.url ?? "");
+      if (url.startsWith("data:")) {
+        const mm = /^data:(image\/[\w.+-]+);base64,([\s\S]*)$/.exec(url);
+        const f = mm && saveBase64Image(mm[2], mm[1]);
+        if (f) files.push(f);
+      } else if (/^https?:\/\//.test(url)) remote++;
+    }
+  }
+  return { files, remote };
+}
+
+function cleanupTempFiles(files) {
+  for (const f of files || []) {
+    if (typeof f === "string" && f.startsWith(os.tmpdir() + path.sep) && path.basename(f).startsWith("oc-img-")) {
+      fs.promises.unlink(f).catch(() => {});
+    }
+  }
 }
 
 // Flatten OpenAI messages into one prompt (CLI takes a single prompt;
@@ -166,7 +243,7 @@ function buildPrompt(messages, tools, toolChoice) {
       : toolChoice === "required"
         ? `\nYou MUST call at least one of the functions below now (not in later turns).`
         : "";
-    prompt += `\n\n[Available functions — you may EITHER answer with plain text OR request function calls. Do not use any other tools. Functions:\n${JSON.stringify(defs)}\nTo request calls, emit one fenced block per call (nothing else inside the fence matters):\n\`\`\`tool_call\n{"name": "<function name>", "arguments": {<JSON object matching parameters>}}\n\`\`\`\nIf no call is needed, just answer in plain text without any fence.${forced}]`;
+    prompt += `\n\n[Available functions — you may EITHER answer with plain text OR request function calls. Do not use any other tools. Functions:\n${JSON.stringify(defs)}\nTo request calls, emit one fenced block per call (nothing else inside the fence matters):\n\`\`\`tool_call\n{"name": "<function name>", "arguments": {<JSON object matching parameters>}}\n\`\`\`\nCRITICAL: argument key names are case-sensitive — copy them EXACTLY as defined above (usually snake_case like file_path, old_string). NEVER use camelCase variants (filePath, oldString, newString are WRONG and will be rejected).\nIf no call is needed, just answer in plain text without any fence.${forced}]`;
   } else {
     prompt += `\n[Text answer only, do not call any tools.]`;
   }
@@ -175,31 +252,93 @@ function buildPrompt(messages, tools, toolChoice) {
 
 // Extract fenced ```tool_call {"name","arguments"} blocks, validated
 // against the client-provided definitions. Returns OAI-style tool_calls.
+// Key repair: models running inside opencode CLI often emit its native
+// camelCase keys (filePath) instead of the client's snake_case (file_path) —
+// remap when the schema confirms the target, then enforce `required`.
+function camelToSnake(s) {
+  return s.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
+}
 function parseToolCalls(text, tools) {
   const defs = new Map((tools || []).map((t) => [t.function?.name, t]));
-  const calls = [];
-  const re = /```tool_call\s*([\s\S]*?)```/g;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    let obj;
-    try { obj = JSON.parse(m[1].trim()); } catch { continue; }
-    if (!obj || typeof obj.name !== "string" || !defs.has(obj.name)) continue;
-    const args = obj.arguments && typeof obj.arguments === "object" ? obj.arguments : {};
-    calls.push({
+  const debug = [];
+  const tryObj = (obj, where) => {
+    if (!obj || typeof obj.name !== "string" || !defs.has(obj.name)) return;
+    const params = defs.get(obj.name).function?.parameters || {};
+    const props = params.properties || {};
+    const required = params.required || [];
+    const rawArgs = obj.arguments ?? obj.parameters ?? obj.input;
+    let args = rawArgs && typeof rawArgs === "object" ? { ...rawArgs } : {};
+    if (typeof rawArgs === "string") { try { args = JSON.parse(rawArgs); } catch { args = {}; } }
+    for (const k of Object.keys(args)) {
+      if (!(k in props) && camelToSnake(k) in props) {
+        args[camelToSnake(k)] = args[k];
+        delete args[k];
+      }
+    }
+    if (!required.every((k) => k in args)) {
+      debug.push(`${obj.name}@${where}: missing required`);
+      return null;
+    }
+    return {
       id: "call_" + crypto.randomBytes(12).toString("hex"),
       type: "function",
       function: { name: obj.name, arguments: JSON.stringify(args) },
-    });
+    };
+  };
+  const calls = [];
+  const re = /```tool_call\s*([\s\S]*?)```/g;
+  let m;
+  let fences = 0;
+  while ((m = re.exec(text)) !== null) {
+    fences++;
+    let obj;
+    try { obj = JSON.parse(m[1].trim()); } catch { debug.push(`fence#${fences}: bad json`); continue; }
+    const c = tryObj(obj, `fence#${fences}`);
+    if (c) calls.push(c);
+  }
+  // Fallback: plain ```json fences or bare {"name","arguments"} objects
+  // (models that half-follow the format). Only when fences gave nothing.
+  if (!calls.length) {
+    const reJ = /```(?:json)?\s*(\{[\s\S]*?\})\s*```/g;
+    while ((m = reJ.exec(text)) !== null) {
+      let obj;
+      try { obj = JSON.parse(m[1]); } catch { continue; }
+      const c = tryObj(obj, "json-fence");
+      if (c) calls.push(c);
+    }
+    if (!calls.length) {
+      const reB = /\{\s*"name"\s*:\s*"([A-Za-z0-9_\-]+)"\s*,\s*"(arguments|parameters|input)"\s*:\s*(\{[\s\S]*?\})\s*\}/g;
+      while ((m = reB.exec(text)) !== null) {
+        if (!defs.has(m[1])) continue;
+        let a = {};
+        try { a = JSON.parse(m[3]); } catch { continue; }
+        const c = tryObj({ name: m[1], arguments: a }, "bare-json");
+        if (c) calls.push(c);
+      }
+    }
+  }
+  if (process.env.PROXY_DEBUG) {
+    try {
+      fs.appendFileSync("./proxy-debug.log",
+        `[${new Date().toISOString()}] fences=${fences} calls=${calls.length}` +
+        (debug.length ? ` dropped=[${debug.join("; ")}]` : "") +
+        ` preview=${JSON.stringify(stripFences(text).slice(0, 200))}\n`);
+    } catch {}
   }
   return calls;
 }
 
 // Run genuine `opencode run --format json`, prompt via stdin.
+// opts: { variant?: string, files?: string[] }
 // Returns { text, usage:{input,output}, sessionId }.
-function cliRun(model, prompt, sessionId) {
+function cliRun(model, prompt, sessionId, opts = {}) {
   return new Promise((resolve, reject) => {
     const args = ["run", "--model", `opencode/${model}`, "--format", "json"];
     if (sessionId) args.push("--session", sessionId);
+    const variant = pickVariant(model, opts.variant);
+    if (variant) args.push("--variant", variant);
+    const files = (opts.files || []).filter((f) => typeof f === "string" && fs.existsSync(f));
+    for (const f of files.slice(0, 8)) args.push("--file", f);
     let child;
     try {
       child = spawn(OPENCODE_BIN, args, { cwd: CLI_DIR, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
@@ -216,6 +355,7 @@ function cliRun(model, prompt, sessionId) {
     child.stderr.on("data", (d) => { errText += d.toString(); });
     child.on("error", (e) => {
       clearTimeout(timer);
+      cleanupTempFiles(files);
       reject(new Error("spawn error: " + e.message));
     });
     child.on("close", (code) => {
@@ -241,6 +381,7 @@ function cliRun(model, prompt, sessionId) {
           firstErr = ev.error?.data?.message || ev.error?.name || "CLI error";
         }
       }
+      cleanupTempFiles(files);
       if (text) return resolve({ text, usage, sessionId: ses });
       reject(new Error(firstErr || `CLI exited ${code} with no text${errText ? ": " + errText.slice(0, 200) : ""}`));
     });
@@ -376,9 +517,9 @@ function toOAIObject(model, text, usage, calls) {
   };
 }
 
-async function runForUser(user, model, messages, tools, toolChoice) {
+async function runForUser(user, model, messages, tools, toolChoice, opts = {}) {
   return withLock(user, async () => {
-    const out = await cliRun(model, buildPrompt(messages, tools, toolChoice), cliSessions[user]);
+    const out = await cliRun(model, buildPrompt(messages, tools, toolChoice), cliSessions[user], opts);
     if (out.sessionId && out.sessionId !== cliSessions[user]) {
       cliSessions[user] = out.sessionId;
       saveCliSessions();
@@ -388,11 +529,13 @@ async function runForUser(user, model, messages, tools, toolChoice) {
 }
 
 // Split CLI text into final content + validated tool calls.
+function stripFences(text) {
+  return String(text || "").replace(/```tool_call\s*[\s\S]*?```/g, "").trim();
+}
 function splitToolCalls(text, tools, toolChoice) {
   if (!tools?.length || toolChoice === "none") return { content: text, calls: [] };
   const calls = parseToolCalls(text, tools);
-  if (!calls.length) return { content: text, calls: [] };
-  const content = text.split("```tool_call")[0].trim() || null;
+  const content = stripFences(text) || null;
   return { content, calls };
 }
 
@@ -410,16 +553,24 @@ app.post("/v1/chat/completions", async (req, res) => {
   const user = auth(req);
   if (!user) return res.status(401).json({ error: { message: "Invalid API key" } });
 
-  const { model, messages, stream, tools, tool_choice } = req.body;
+  const { model, messages, stream, tools, tool_choice, reasoning_effort, reasoning } = req.body;
   if (!MODELS.includes(model)) {
     return res.status(400).json({ error: { message: `Unknown model: ${model}. Available: ${MODELS.join(", ")}` } });
   }
+  const wantEffort = reasoning_effort ?? reasoning?.effort;
+  const variant = pickVariant(model, wantEffort);
+  if (wantEffort && !variant) {
+    return res.status(400).json({ error: { message: `Model ${model} does not support reasoning effort "${wantEffort}". Supported: ${(VARIANTS[model] || []).join(", ") || "none (provider default)"}` } });
+  }
+  const { files, remote } = extractOpenAIImages(messages);
 
   console.log("[OAI]", new Date().toISOString(), user, model, stream ? "stream" : "sync",
-    "msgs:", (messages || []).length, tools?.length ? `tools:${tools.length}` : "no-tools");
+    "msgs:", (messages || []).length, tools?.length ? `tools:${tools.length}` : "no-tools",
+    variant ? `variant:${variant}` : "variant:default",
+    files.length ? `images:${files.length}` : "", remote ? `remote-images:${remote}(url-only)` : "");
 
   try {
-    const r = await runForUser(user, model, messages, tools, tool_choice);
+    const r = await runForUser(user, model, messages, tools, tool_choice, { variant, files });
     const { content, calls } = splitToolCalls(r.text, tools, tool_choice);
     const oai = toOAIObject(model, content, r.usage, calls);
     if (!stream) return res.json(oai);
@@ -462,6 +613,24 @@ app.post("/v1/messages", async (req, res) => {
   }
 
   const { messages, tools } = anthropicToOpenAI(req.body);
+  // Anthropic image blocks are dropped by the conversion above, so persist
+  // them first and reference them from the prompt + CLI attachments.
+  const antFiles = [];
+  for (const msg of req.body.messages || []) {
+    if (!Array.isArray(msg?.content)) continue;
+    for (const b of msg.content) {
+      if (b?.type === "image" && b.source?.type === "base64" && b.source?.data) {
+        const f = saveBase64Image(b.source.data, b.source.media_type);
+        if (f) antFiles.push(f);
+      }
+    }
+  }
+  if (antFiles.length) {
+    const lastUser = [...messages].reverse().find((m) => m.role === "user");
+    const note = `[${antFiles.length} image(s) attached as file(s) — see attached files]`;
+    if (lastUser) lastUser.content = `${lastUser.content || ""}\n${note}`;
+    else messages.push({ role: "user", content: note });
+  }
   const toolChoice = !antChoice || antChoice.type === "auto" ? undefined
     : antChoice.type === "none" ? "none"
     : antChoice.type === "any" ? "required"
@@ -469,10 +638,11 @@ app.post("/v1/messages", async (req, res) => {
   const inputTokens = JSON.stringify(messages).length / 4 | 0;
 
   console.log("[ANT]", new Date().toISOString(), user, model, stream ? "stream" : "sync",
-    "msgs:", messages.length, tools?.length ? `tools:${tools.length}` : "no-tools");
+    "msgs:", messages.length, tools?.length ? `tools:${tools.length}` : "no-tools",
+    antFiles.length ? `images:${antFiles.length}` : "");
 
   try {
-    const r = await runForUser(user, model, messages, tools, toolChoice);
+    const r = await runForUser(user, model, messages, tools, toolChoice, { files: antFiles });
     const { content, calls } = splitToolCalls(r.text, tools, toolChoice);
     const oai = toOAIObject(model, content, r.usage, calls);
     if (!stream) {

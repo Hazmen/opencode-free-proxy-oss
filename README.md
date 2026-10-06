@@ -4,7 +4,8 @@
 
 A local **OpenAI-compatible** (`/v1/chat/completions`) and **Anthropic-compatible**
 (`/v1/messages`) endpoint for [OpenCode](https://opencode.ai) free-tier models —
-with **real tool calling**, **auto-fetching free models**, and an optional
+with **real tool calling**, **reasoning effort**, **image attachments**,
+**auto-fetching free models**, and an optional
 Windows **tray icon + autostart**.
 
 Point any client at it — Cursor, Continue, Cline, Claude Code, aider, opencode CLI,
@@ -126,6 +127,21 @@ curl http://localhost:6446/v1/messages \
 ```
 
 `tool_use` / `tool_result` blocks are supported in both directions.
+
+### Reasoning effort
+
+Pass OpenAI-style `reasoning_effort` (or `{ "reasoning": { "effort": ... } }`) —
+the proxy maps it to the model's native `--variant` flag. Supported values
+depend on the model (see `VARIANTS` in `server.mjs`, sourced from
+`opencode models opencode --verbose`); unknown values return HTTP 400 listing
+what the model accepts. Example: `"reasoning_effort": "high"`.
+
+### Images
+
+Vision works through attachments: OpenAI `image_url` (base64 `data:` URLs) and
+Anthropic `image` blocks are saved to temp files and handed to the model via
+`opencode run --file`. Remote URLs can't be fetched by the proxy and are passed
+as URL-only placeholders (max 4 noted in the prompt).
 
 ### Other endpoints
 
@@ -271,7 +287,7 @@ MIT
 
 Локальный **OpenAI-совместимый** (`/v1/chat/completions`) и
 **Anthropic-совместимый** (`/v1/messages`) endpoint для бесплатных моделей
-[OpenCode](https://opencode.ai) — с **настоящим tool calling**,
+[OpenCode](https://opencode.ai) — с **настоящим tool calling**, **уровнем мышления**, **аттачментами картинок**,
 **автоподтягиванием бесплатных моделей** и опциональной иконкой в трее Windows
 + автозапуском.
 
@@ -395,6 +411,19 @@ curl http://localhost:6446/v1/messages \
 ```
 
 Блоки `tool_use` / `tool_result` поддерживаются в обе стороны.
+
+### Уровень мышления (reasoning effort)
+
+Передай OpenAI-стиль `reasoning_effort` (или `{ "reasoning": { "effort": ... } }`) —
+прокси смаппит его в нативный флаг модели `--variant`. Допустимые значения зависят
+от модели (см. `VARIANTS` в `server.mjs`, источник — `opencode models opencode --verbose`);
+неизвестные вернут HTTP 400 со списком допустимых. Пример: `"reasoning_effort": "high"`.
+
+### Картинки
+
+Vision работает через аттачменты: OpenAI `image_url` (base64 `data:`) и Anthropic-блоки
+`image` сохраняются во временные файлы и уходят модели через `opencode run --file`.
+Удалённые URL прокси скачать не может — уходят плейсхолдером (первые 4 — текстом в промпте).
 
 ### Остальные endpoint'ы
 
