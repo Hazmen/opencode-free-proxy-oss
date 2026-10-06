@@ -1,0 +1,5 @@
+node_modules/
+api-keys.json
+cli-sessions.json
+*.log
+.env

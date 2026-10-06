@@ -1,0 +1,18 @@
+{
+  "name": "opencode-free-proxy",
+  "version": "1.0.0",
+  "description": "Local OpenAI/Anthropic-compatible endpoint for OpenCode free-tier models (CLI backend, tool calling, auto model fetch)",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node --watch server.mjs"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
