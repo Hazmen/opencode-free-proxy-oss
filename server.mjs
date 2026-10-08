@@ -12,7 +12,7 @@ app.use(express.json({ limit: "10mb" }));
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 const PORT = process.env.PROXY_PORT || 6446;
-const PROXY_VERSION = "17";
+const PROXY_VERSION = "19";
 const BACKEND = "cli"; // requests are executed by genuine `opencode run`
 
 // Resolve opencode binary: $OPENCODE_BIN → default npm location → PATH.
@@ -219,7 +219,12 @@ function cleanupTempFiles(files) {
 // full transcript is replayed every call so the model keeps context).
 // Client tool schemas ARE forwarded as definitions; the model must emit
 // fenced ```tool_call blocks which the proxy converts to real tool_calls.
-// The CLI's own native tools stay forbidden (text/function-request only).
+// The CLI's own native tools stay forbidden by prompt (text fences only).
+// NOTE: they cannot be disabled via permission/--agent: any custom agent
+// with permission deny makes Zen answer 403 "free tier can only be used
+// from within OpenCode". So the prompt must explicitly steer the model away
+// from native camelCase tools (same names, WRONG directory, permission
+// REJECTED in non-interactive `opencode run`) toward fenced snake_case calls.
 function buildPrompt(messages, tools, toolChoice) {
   const sys = (messages || []).filter((m) => m.role === "system").map(msgText).join("\n");
   const rest = (messages || []).filter((m) => m.role !== "system").map((m) => {
@@ -243,7 +248,18 @@ function buildPrompt(messages, tools, toolChoice) {
       : toolChoice === "required"
         ? `\nYou MUST call at least one of the functions below now (not in later turns).`
         : "";
-    prompt += `\n\n[Available functions — you may EITHER answer with plain text OR request function calls. Do not use any other tools. Functions:\n${JSON.stringify(defs)}\nTo request calls, emit one fenced block per call (nothing else inside the fence matters):\n\`\`\`tool_call\n{"name": "<function name>", "arguments": {<JSON object matching parameters>}}\n\`\`\`\nCRITICAL: argument key names are case-sensitive — copy them EXACTLY as defined above (usually snake_case like file_path, old_string). NEVER use camelCase variants (filePath, oldString, newString are WRONG and will be rejected).\nIf no call is needed, just answer in plain text without any fence.${forced}]`;
+    const exampleName = defs[0]?.name || "read";
+    const exampleArgs = (() => {
+      const props = defs[0]?.parameters?.properties || {};
+      const keys = Object.keys(props);
+      if (keys.length) {
+        const o = {};
+        for (const k of keys.slice(0, 3)) o[k] = props[k]?.type === "number" ? 1 : `value-for-${k}`;
+        return JSON.stringify(o);
+      }
+      return `{"file_path": "statistics.html"}`;
+    })();
+    prompt += `\n\n[Available client functions — you may EITHER answer with plain text OR request function calls. Functions:\n${JSON.stringify(defs)}\nHOW TO CALL: to request calls, emit one fenced block per call:\n\`\`\`tool_call\n{"name": "<function name>", "arguments": {<JSON object matching parameters>}}\n\`\`\`\nExample:\n\`\`\`tool_call\n{"name": "${exampleName}", "arguments": ${exampleArgs}}\n\`\`\`\nCRITICAL RULES:\n- You are a TEXT-ONLY bridge. You have NO filesystem, NO shell, NO working-directory access here. NEVER invoke your own built-in opencode tools (read/write/edit/glob/grep/bash/task/etc.): they act on the WRONG directory, their permission will be REJECTED, and the client's file will never be read. The fenced block above is the ONLY way to act.\n- NAME COLLISION WARNING: your built-in tools may share names with the client functions (e.g. read, grep), but they are DIFFERENT tools with camelCase keys (filePath, oldString). IGNORE the built-in variants completely.\n- Argument key names are case-sensitive — copy them EXACTLY as defined above (usually snake_case like file_path, old_string). Emit ONLY keys listed in the function's properties. NEVER emit camelCase variants (filePath, oldString, newString are WRONG and will be rejected). NEVER add extra keys.\n- One fence per call, nothing else inside the fence. Do not wrap the fence in more JSON.\nIf no call is needed, just answer in plain text without any fence.${forced}]`;
   } else {
     prompt += `\n[Text answer only, do not call any tools.]`;
   }
@@ -273,6 +289,14 @@ function parseToolCalls(text, tools) {
       if (!(k in props) && camelToSnake(k) in props) {
         args[camelToSnake(k)] = args[k];
         delete args[k];
+      }
+    }
+    // Drop unknown keys when the schema declares properties: strict
+    // validators (e.g. DSH) reject extra camelCase leftovers or hallucinated
+    // keys. Schemas without properties stay untouched (open schema).
+    if (Object.keys(props).length) {
+      for (const k of Object.keys(args)) {
+        if (!(k in props)) delete args[k];
       }
     }
     if (!required.every((k) => k in args)) {
@@ -331,9 +355,28 @@ function parseToolCalls(text, tools) {
 // Run genuine `opencode run --format json`, prompt via stdin.
 // opts: { variant?: string, files?: string[] }
 // Returns { text, usage:{input,output}, sessionId }.
+// NOTE: runs under the prompt-only `proxy-bridge` agent (see
+// .opencode/agents/proxy-bridge.md): no permission field on purpose — any
+// custom agent WITH permission deny makes Zen answer 403 "free tier can only
+// be used from within OpenCode" (verified). The agent prompt steers the model
+// away from native camelCase tools toward fenced snake_case calls.
+const BRIDGE_AGENT = "proxy-bridge";
+function ensureBridgeAgent() {
+  try {
+    const dir = path.join(CLI_DIR, ".opencode", "agents");
+    const file = path.join(dir, BRIDGE_AGENT + ".md");
+    if (!fs.existsSync(file)) {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(file, `---\ndescription: Text-only bridge for the free-proxy pipeline\nmode: primary\n---\n\nYou are a TEXT-ONLY bridge inside the opencode-free-proxy pipeline. NEVER invoke your own built-in opencode tools (read, write, edit, glob, grep, bash, task, webfetch, or any native tool): they act on the WRONG directory and their permission is REJECTED here. When the prompt lists client functions, emit one fenced block per call:\n\n\`\`\`tool_call\n{"name": "<function name>", "arguments": {<JSON object>}}\n\`\`\`\n\nCopy argument keys EXACTLY (snake_case). Otherwise answer in plain text.\n`);
+      console.log("[INIT] wrote bridge agent →", file);
+    }
+  } catch (e) {
+    console.log("[INIT] bridge agent check failed:", e.message);
+  }
+}
 function cliRun(model, prompt, sessionId, opts = {}) {
   return new Promise((resolve, reject) => {
-    const args = ["run", "--model", `opencode/${model}`, "--format", "json"];
+    const args = ["run", "--model", `opencode/${model}`, "--agent", BRIDGE_AGENT, "--format", "json"];
     if (sessionId) args.push("--session", sessionId);
     const variant = pickVariant(model, opts.variant);
     if (variant) args.push("--variant", variant);
@@ -529,8 +572,20 @@ async function runForUser(user, model, messages, tools, toolChoice, opts = {}) {
 }
 
 // Split CLI text into final content + validated tool calls.
+// Strips ```tool_call fences always, plus ```json fences that actually
+// contain a tool call ({ "name", "arguments" }), so fallback-format calls
+// don't leak JSON garbage into the visible text.
 function stripFences(text) {
-  return String(text || "").replace(/```tool_call\s*[\s\S]*?```/g, "").trim();
+  return String(text || "")
+    .replace(/```tool_call\s*[\s\S]*?```/g, "")
+    .replace(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/g, (m, j) => {
+      try {
+        const o = JSON.parse(j);
+        if (o && typeof o.name === "string" && (o.arguments || o.parameters || o.input)) return "";
+      } catch {}
+      return m;
+    })
+    .trim();
 }
 function splitToolCalls(text, tools, toolChoice) {
   if (!tools?.length || toolChoice === "none") return { content: text, calls: [] };
@@ -706,6 +761,7 @@ app.get("/health", (_req, res) => res.json({
 }));
 
 // ── Start ──────────────────────────────────────────────────────────
+ensureBridgeAgent();
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`OpenCode Free Proxy v${PROXY_VERSION} (backend=${BACKEND}) on http://0.0.0.0:${PORT}`);
   console.log(`  CLI binary:  ${OPENCODE_BIN}`);

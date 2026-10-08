@@ -267,6 +267,12 @@ replayed (not live) streaming.
 Tool calling: your `tools` schemas are forwarded as definitions, the model
 requests calls, the proxy returns standard `tool_calls`/`tool_use` — execution
 stays on your side. The CLI's own shell tools are never exposed to clients.
+Every CLI run goes through the prompt-only `proxy-bridge` agent
+(`.opencode/agents/proxy-bridge.md`, auto-created on start): the model is told
+to never touch its native tools — they act on the wrong directory and get
+permission-rejected — and to emit fenced `tool_call` blocks with exact
+snake_case keys instead. (Disabling native tools via permission config is not
+possible: any agent with `permission: deny` makes Zen answer 403.)
 
 ## Privacy
 
@@ -548,7 +554,13 @@ CLI-бинарник. Следствия: ~10–20с латентности на
 
 Tool calling: твои схемы `tools` уходят модели определениями, модель просит
 вызовы, прокси отдаёт стандартные `tool_calls`/`tool_use` — исполнение остаётся
-на твоей стороне. Шелл-тулзы самого CLI клиентам не светятся.
+на твоей стороне. Шелл-тулзы самого CLI клиентам не светятся. Каждый CLI-запуск
+идёт через prompt-only агента `proxy-bridge`
+(`.opencode/agents/proxy-bridge.md`, создаётся сам при старте): модели запрещено
+трогать нативные тулзы — они бьют по чужой директории и валятся в
+permission-rejected — вместо этого она эмитит fenced-блоки `tool_call` с точным
+snake_case. (Отключить нативные тулзы конфигом пермишенов нельзя: любой агент с
+`permission: deny` получает от Zen 403.)
 
 ## Приватность
 
